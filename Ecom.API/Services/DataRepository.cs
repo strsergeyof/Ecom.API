@@ -1,10 +1,14 @@
 ﻿using Ecom.API.Models;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using MySql.Data.MySqlClient;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Org.BouncyCastle.Math;
+using Polly;
 using System.Data;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -39,7 +43,6 @@ namespace Ecom.API.Services
         public Dictionary<int, List<string>> MessageUnits { get; set; } = new Dictionary<int, List<string>>();
         public Dictionary<int, List<string>> MessageCompetitors { get; set; } = new Dictionary<int, List<string>>();
         #endregion
-
 
         #region Конструктор по умолчанию
 
@@ -1028,6 +1031,7 @@ namespace Ecom.API.Services
                 tasks.Add(Task.Run(async () =>
                 {
                     storesCount++;
+
                     await semaphoreSlim.WaitAsync();
 
                     try
@@ -1037,13 +1041,15 @@ namespace Ecom.API.Services
 
                         var Units = keyValuePairs[store.Id];
                         var units = await FetchUnitFromApi(store);
-                        var commonElements = Units.Intersect(units).ToList();
+                        List<rise_unit> matchingUnits = Units.Where(u1 => units.Any(u2 => u1.NmID == u2.NmID)).ToList();
 
-                        if (commonElements.Count > 0)
-                            await BulkInsertEntitiesAsync("rise_units", commonElements);
+                        if (matchingUnits.Count > 0)
+                            await BulkInsertEntitiesAsync("rise_units", matchingUnits);
 
                         if (units.Count > 0)
                             await BulkLoader("rise_units", units);
+
+                        unitsCount += units.Count;
 
                         stopwatch.Stop();
                         TimeSpan elapsed = stopwatch.Elapsed;
@@ -1067,19 +1073,16 @@ namespace Ecom.API.Services
 
             await Task.WhenAll(tasks);
 
-            foreach (var store in stores)
+                foreach (var store in stores)
                     await _context.Database.ExecuteSqlAsync(FormattableStringFactory.Create($"call UpdateUnits({store.Id})"));
 
             _stopwatch.Stop();
 
             TimeSpan _elapsed = _stopwatch.Elapsed;
-            int _hours = _elapsed.Hours;
-            int _minutes = _elapsed.Minutes;
-            int _seconds = _elapsed.Seconds;
 
             await InsertAndEditMessage(messageUnits, MessageUnits, $@"✅ Успешно: `{storesCount - errors} из {storesCount}`
 🆕 Загружено строк `{unitsCount} шт.`
-⏱️ Потраченное время: `{_hours} ч {_minutes} м. {_seconds} с.`");
+⏱️ Потраченное время: `{_elapsed.Hours} ч {_elapsed.Minutes} м. {_elapsed.Seconds} с.`");
 
             MessageUnits.Clear();
         }
@@ -1135,18 +1138,24 @@ namespace Ecom.API.Services
         {
 
             List<rise_unit> Units = new List<rise_unit>();
+            var client = _httpClientFactory.CreateClient();
+            int offset = 0;
 
-            string apiUrl = "https://discounts-prices-api.wb.ru/api/v2/list/goods/filter";
-            string servUrl = apiUrl + "?limit=1000";
+            bool fetch = true;
 
-            try
+            while (fetch)
             {
-                using (HttpClient client = new HttpClient())
+                try
                 {
-                    client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                    client.DefaultRequestHeaders.Add("Authorization", store.Token);
+                    
+                    string apiUrl = "https://discounts-prices-api.wb.ru/api/v2/list/goods/filter";
+                    string servUrl = apiUrl + $"?limit=1000&offset={offset}";
 
-                    HttpResponseMessage response = await client.GetAsync(servUrl);
+                    var requestMessage = new HttpRequestMessage(HttpMethod.Get, servUrl);
+                    requestMessage.Headers.Add("contentType", "application/json");
+                    requestMessage.Headers.Add("Authorization", store.Token);
+
+                    HttpResponseMessage response = await client.SendAsync(requestMessage);
                     if (response.IsSuccessStatusCode)
                     {
                         string responseData = await response.Content.ReadAsStringAsync();
@@ -1164,7 +1173,6 @@ namespace Ecom.API.Services
 
                             rise_unit price = new rise_unit()
                             {
-                                Url = GetWbImageUrl(good.nmID.ToString()),
                                 Sa_name = good.vendorCode,
                                 NmID = good.nmID,
                                 Promotion_name = promotions.FirstOrDefault(x => x.Id == good.nmID)?.PromoTextCat,
@@ -1177,21 +1185,21 @@ namespace Ecom.API.Services
                             Units.Add(price);
                         }
 
-                        return Units;
+                        if (goodsList.Count < 1000)
+                            fetch = false;
+                        else
+                            offset += goodsList.Count;
                     }
-
-
                     else
-                    {
-                        return Units;
-                    }
+                        fetch = false;
+                }
+                catch (Exception ex)
+                {
+
                 }
             }
-            catch (Exception ex)
-            {
 
-                return Units;
-            }
+            return Units;
         }
 
         public static async Task<List<Promotion>> GetPromotionFromApi(List<long?> nmID)
@@ -1446,99 +1454,66 @@ namespace Ecom.API.Services
         /// Загрузка карточек Wildberries
         /// </summary>
         /// <returns></returns>
+        /// <summary>
+        /// Загрузка карточек Wildberries
+        /// </summary>
+        /// <returns></returns>
         public async Task CardsWildberries(int? id = null)
         {
             var stores = id is null ? _context.rise_projects
-                .Where(x => !string.IsNullOrWhiteSpace(x.Token)
-                && x.Token.Length > 155
-                && x.Deleted.Value == false)
-                .ToList() :
-                _context.rise_projects.Where(x => x.Id == id)
-                .Where(x => !string.IsNullOrWhiteSpace(x.Token)
-                && x.Token.Length > 155
-                && x.Deleted.Value == false)
-                .ToList();
+                  .Where(x => !string.IsNullOrWhiteSpace(x.Token)
+                  && x.Token.Length > 155
+                  && x.Deleted.Value == false)
+                  .ToList() :
+                  _context.rise_projects.Where(x => x.Id == id)
+                  .Where(x => !string.IsNullOrWhiteSpace(x.Token)
+                  && x.Token.Length > 155
+                  && x.Deleted.Value == false)
+                  .ToList();
+
+            var messageCards = await _telegramBot.SendTextMessageAsync("740755376", "Загрузка карточек валбериз",
+                parseMode: Telegram.Bot.Types.Enums.ParseMode.Markdown);
+
+            foreach (var store in stores)
+            {
+                try
+                {
+                    Stopwatch stopwatch = new Stopwatch();
+                    stopwatch.Start();
+
+                    //Старые карточки
+                    List<Card> cardWildberriesOld = _context.Cards.Where(x => x.ProjectId == store.Id)?.ToList();
+
+                    //Новые карточки
+                    List<Card> cardWildberriesNew = await FetchCardWildberriesFromApi(store);
 
 
-            //            int cardsCount = 0;
-            //            int _stores = 0;
-            //            int error = 0;
-            //            var messageCards = await _telegramBot.SendTextMessageAsync("740755376", "Загрузка карточек валбериз",
-            //                parseMode: Telegram.Bot.Types.Enums.ParseMode.Markdown);
+                    _context.Cards.RemoveRange(cardWildberriesOld);
+                    await _context.SaveChangesAsync();
 
-            //            MessageCards.Add(messageCards.MessageId, new List<string>());
+                    await _context.Cards.AddRangeAsync(cardWildberriesNew);
+                    await _context.SaveChangesAsync();
 
-            //            Stopwatch _stopwatch = new Stopwatch();
-            //            _stopwatch.Start();
+                    stopwatch.Stop();
 
+                    TimeSpan elapsed = stopwatch.Elapsed;
+                    int hours = elapsed.Hours;
+                    int minutes = elapsed.Minutes;
+                    int seconds = elapsed.Seconds;
 
-            //            var tasks = new List<Task>();
-            //            var semaphoreSlim = new SemaphoreSlim(10, 10);
+                    await InsertAndEditMessage(messageCards, MessageCards, @$"🏦 Магазин `{store.Title}`
+🔄 Обновлено строк `{cardWildberriesOld.Count} шт.`
+🆕 Загружено строк `{cardWildberriesNew.Count - cardWildberriesOld.Count} шт.`
+⏱️ Время загрузки карточек валбериз `{hours} ч {minutes} м. {seconds} с.`");
 
-            //            //Старые карточки
-            //            List<Card> cardWildberriesOld = await _context.Cards.ToListAsync();
-
-            //            _context.Cards.RemoveRange(cardWildberriesOld);
-            //            await _context.SaveChangesAsync();
-
-            //            foreach (var store in stores)
-            //            {
-            //                tasks.Add(Task.Run(async () =>
-            //                {
-            //                    await semaphoreSlim.WaitAsync();
-
-            //                    try
-            //                    {
-            //                        Stopwatch stopwatch = new Stopwatch();
-            //                        stopwatch.Start();
-
-            //                        var cards = await FetchCardWildberriesFromApi(store);
-
-            //                        if (cards.Count > 0)
-            //                            await BulkLoader("Cards", cards);
-
-
-            //                        storesCount++;
-
-            //                        stopwatch.Stop();
-            //                        TimeSpan elapsed = stopwatch.Elapsed;
-
-            //                        MessageIncomes[messageIncomes.MessageId].Add(@$"🏦 Магазин `{store.Title}`
-            //🆕 Загружено строк `{incomes.Count} шт.`
-            //⏱️ Время загрузки поставок `{elapsed.Hours} ч {elapsed.Minutes} м. {elapsed.Seconds} с.`");
-            //                    }
-            //                    catch (Exception ex)
-            //                    {
-            //                        errors++;
-            //                        MessageIncomes[messageIncomes.MessageId].Add(@$"🏦 Магазин `{store.Title}`
-            //`{ex.Message.ToString()}`");
-            //                    }
-            //                    finally
-            //                    {
-            //                        semaphoreSlim.Release();
-            //                    }
-            //                }));
-            //            }
-
-            //            await Task.WhenAll(tasks);
-
-            //            _stopwatch.Stop();
-
-            //            TimeSpan _elapsed = _stopwatch.Elapsed;
-            //            int _hours = _elapsed.Hours;
-            //            int _minutes = _elapsed.Minutes;
-            //            int _seconds = _elapsed.Seconds;
-
-            //            MessageCards[messageCards.MessageId].Add($@"✅ Успешно: `{_stores - error} из {_stores}`
-            //🆕 Загружено строк `{cardsCount} шт.`
-            //⏱️ Потраченное время: `{_hours} ч {_minutes} м. {_seconds} с.`");
-
-            //            string text = string.Join($"{Environment.NewLine}{Environment.NewLine}",
-            //                MessageCards.Where(kv => kv.Key == messageCards.MessageId).SelectMany(kv => kv.Value));
-
-            //            await EditMessage(messageCards, text);
-
-            //            MessageCards.Clear();
+                }
+                catch (Exception ex)
+                {
+                    await InsertAndEditMessage(messageCards, MessageCards,
+                         @$"🏦 Магазин `{store.Title}`
+```{ex.Message.ToString()}```");
+                }
+            }
 
         }
 
